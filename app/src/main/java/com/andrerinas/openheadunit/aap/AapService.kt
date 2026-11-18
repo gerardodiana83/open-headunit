@@ -213,7 +213,71 @@ class AapService : Service() {
         } catch (e: Exception) {
             // Catching binder death: DeadObjectException or DeadSystemException
             AppLog.e("MediaSession call failed (Binder dead?): ${e.message}")
+            // A dead session never receives media buttons again. Previously this was only logged,
+            // so steering wheel keys stayed dead until the app was reinstalled/restarted.
+            scheduleMediaSessionRebuild("call failed: ${e.javaClass.simpleName}")
             null
+        }
+    }
+
+    private var lastMediaSessionRebuildAt = 0L
+    private var mediaSessionRebuildPosted = false
+
+    /** Asks for a rebuild on the main thread, rate-limited so a persistent failure cannot loop. */
+    private fun scheduleMediaSessionRebuild(reason: String) {
+        if (isDestroying || mediaSessionRebuildPosted) return
+        val now = SystemClock.elapsedRealtime()
+        if (lastMediaSessionRebuildAt != 0L && now - lastMediaSessionRebuildAt < 10_000L) return
+        mediaSessionRebuildPosted = true
+        android.os.Handler(Looper.getMainLooper()).post {
+            mediaSessionRebuildPosted = false
+            rebuildMediaSession(reason)
+        }
+    }
+
+    /**
+     * Throws away the MediaSessionCompat and builds a fresh one.
+     *
+     * A session that lives for days can go stale: the platform's MediaSessionService may have been
+     * restarted by the head unit firmware, or another session (the factory radio) may have taken
+     * the media-button priority. A new session is registered at the top of the platform's priority
+     * stack, which is exactly what reinstalling the app used to achieve. Must run on the main
+     * thread (MediaSessionCompat needs a Looper); callers off the main thread get it posted.
+     */
+    private fun rebuildMediaSession(reason: String, forceActive: Boolean = false) {
+        if (isDestroying) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            android.os.Handler(Looper.getMainLooper()).post { rebuildMediaSession(reason, forceActive) }
+            return
+        }
+        lastMediaSessionRebuildAt = SystemClock.elapsedRealtime()
+        AppLog.i("MediaSession: rebuilding ($reason)")
+        val wasPlaying = mediaSessionIsPlaying
+        val old = mediaSession
+        // isActive is a local flag in the framework class, so reading it is safe even when the
+        // session's binder is dead. Keep the idle/active state the old session had (an idle session
+        // must stay inactive so the factory radio keeps the steering wheel keys), unless the caller
+        // knows the new one has to be active.
+        val wasActive = try { old?.isActive == true } catch (_: Exception) { false }
+        mediaSession = null
+        try { old?.isActive = false } catch (_: Exception) {}
+        try { old?.release() } catch (_: Exception) {}
+        try {
+            setupMediaSession()
+        } catch (e: Exception) {
+            AppLog.e("MediaSession: rebuild failed: ${e.message}")
+            return
+        }
+        val shouldActivate = shouldActivateMediaSession() && (forceActive || wasActive)
+        // Set the state first, then activate, so the new session enters the priority stack already
+        // advertising its actions.
+        if (shouldActivate) updateMediaSessionState(wasPlaying)
+        try { mediaSession?.isActive = shouldActivate } catch (e: Exception) {
+            AppLog.e("MediaSession: activation after rebuild failed: ${e.message}")
+        }
+        if (shouldActivate) {
+            val meta = lastAaMediaMetadata
+            if (meta != null) applyAaMediaMetadataToSession(meta, cachedAaAlbumArtBitmap)
         }
     }
 
@@ -806,6 +870,13 @@ class AapService : Service() {
                         rearmNativeHotspotAfterWake("SCREEN_ON after ${offSec}s sleep")
                     }
                     FloatingButtonManager.update(this@AapService)
+
+                    // After a sleep the factory radio / MCU services have been active; make sure our
+                    // media session is fresh and on top again so steering wheel keys reach us.
+                    if (commManager.connectionState.value is CommManager.ConnectionState.TransportStarted &&
+                        (offDuration > HIBERNATE_WAKE_THRESHOLD_MS || offDuration < 0)) {
+                        rebuildMediaSession("SCREEN_ON after ${offSec}s")
+                    }
 
                     if (commManager.connectionState.value is CommManager.ConnectionState.TransportStarted) {
                         AppLog.i("WakeDetect: Requesting video focus on wake to restore keyframe")
@@ -1581,7 +1652,10 @@ class AapService : Service() {
         // Activate session-scoped car key receivers (e.g. FYT)
         carKeysManager.onSessionStarted(this)
 
-        // Reactivate the existing MediaSession (created in onCreate, kept alive across disconnects)
+        // Build a fresh MediaSession for every projection session. Reusing one created at service
+        // start let it go stale over days (steering wheel keys silently stopped arriving until a
+        // reinstall). onConnected runs on the main thread, so this is synchronous.
+        rebuildMediaSession("projection connected", forceActive = true)
         val shouldActivate = shouldActivateMediaSession()
         safeMediaSessionCall { it.isActive = shouldActivate }
         if (shouldActivate) {
